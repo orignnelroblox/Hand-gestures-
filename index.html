@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Hand Controls Prototype</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #0b0d12; color: #fff;
+    font-family: system-ui, sans-serif; overflow: hidden;
+  }
+  #app { width: 100vw; height: 100vh; position: relative; }
+  video, canvas {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: cover; transform: scaleX(-1);
+  }
+  #overlay { pointer-events:none; }
+  #panel {
+    position:absolute; left:12px; right:12px; top:12px;
+    padding:12px 14px; border-radius:14px;
+    background:rgba(0,0,0,.58); backdrop-filter: blur(8px);
+    z-index:3;
+  }
+  #gesture { font-size:28px; font-weight:800; }
+  #status { margin-top:4px; font-size:14px; opacity:.8; }
+  #swirl { margin-top:10px; height:8px; background:#252a35; border-radius:99px; overflow:hidden; }
+  #swirlFill { height:100%; width:0%; background:#6ee7ff; transition:width .05s linear; }
+  button {
+    position:absolute; z-index:4; left:50%; bottom:20px;
+    transform:translateX(-50%); border:0; border-radius:999px;
+    padding:14px 24px; font-size:17px; font-weight:700;
+  }
+  #debug {
+    position:absolute; z-index:3; left:12px; bottom:75px;
+    font:12px monospace; background:rgba(0,0,0,.55);
+    padding:8px; border-radius:10px; max-width:calc(100% - 24px);
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <video id="video" playsinline muted></video>
+  <canvas id="overlay"></canvas>
+
+  <div id="panel">
+    <div id="gesture">Waiting…</div>
+    <div id="status">Press START CAMERA.</div>
+    <div id="swirl"><div id="swirlFill"></div></div>
+  </div>
+
+  <div id="debug">Hand: none</div>
+  <button id="start">START CAMERA</button>
+</div>
+
+<script type="module">
+import {
+  GestureRecognizer,
+  FilesetResolver
+} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22-rc.20250304/vision_bundle.mjs";
+
+const MODEL =
+  "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task";
+const WASM =
+  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22-rc.20250304/wasm";
+
+const video = document.getElementById("video");
+const canvas = document.getElementById("overlay");
+const ctx = canvas.getContext("2d");
+const gestureEl = document.getElementById("gesture");
+const statusEl = document.getElementById("status");
+const debugEl = document.getElementById("debug");
+const fill = document.getElementById("swirlFill");
+const startBtn = document.getElementById("start");
+
+let recognizer;
+let lastVideoTime = -1;
+let points = [];
+let swirlScore = 0;
+let lastAngle = null;
+let lastPoint = null;
+
+function resize() {
+  canvas.width = video.videoWidth || innerWidth;
+  canvas.height = video.videoHeight || innerHeight;
+}
+addEventListener("resize", resize);
+
+function distance(a,b) {
+  return Math.hypot(a.x-b.x, a.y-b.y);
+}
+
+function angle(a,b) {
+  return Math.atan2(b.y-a.y, b.x-a.x);
+}
+
+function angleDelta(a,b) {
+  let d = b-a;
+  while (d > Math.PI) d -= Math.PI*2;
+  while (d < -Math.PI) d += Math.PI*2;
+  return d;
+}
+
+function drawLandmarks(lm) {
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  if (!lm) return;
+
+  // Mirror coordinates to match the mirrored camera.
+  for (const p of lm) {
+    const x = (1-p.x) * canvas.width;
+    const y = p.y * canvas.height;
+    ctx.beginPath();
+    ctx.arc(x,y,5,0,Math.PI*2);
+    ctx.fillStyle = "#6ee7ff";
+    ctx.fill();
+  }
+
+  // Highlight index fingertip.
+  const p = lm[8];
+  const x = (1-p.x) * canvas.width;
+  const y = p.y * canvas.height;
+  ctx.beginPath();
+  ctx.arc(x,y,13,0,Math.PI*2);
+  ctx.strokeStyle = "#ffffff";
+  ctx.lineWidth = 3;
+  ctx.stroke();
+}
+
+function updateSwirl(lm, gestureName) {
+  const tip = lm[8]; // index fingertip
+  const wrist = lm[0];
+
+  if (gestureName !== "Pointing_Up") {
+    points = [];
+    lastAngle = null;
+    lastPoint = null;
+    swirlScore = Math.max(0, swirlScore - 0.08);
+    fill.style.width = `${Math.min(100, swirlScore*100)}%`;
+    return;
+  }
+
+  const a = angle(wrist, tip);
+  if (lastAngle !== null) {
+    const d = angleDelta(lastAngle, a);
+    // Accumulate meaningful angular movement.
+    if (Math.abs(d) > 0.035) swirlScore += Math.abs(d) / (Math.PI*2);
+  }
+  lastAngle = a;
+
+  points.push({x:tip.x, y:tip.y, t:performance.now()});
+  if (points.length > 35) points.shift();
+
+  // A simple circle test: the fingertip must move around a center,
+  // with enough path length and enough net angular travel.
+  if (points.length >= 18) {
+    let cx=0, cy=0;
+    for (const p of points) { cx += p.x; cy += p.y; }
+    cx /= points.length; cy /= points.length;
+
+    let totalTurn = 0;
+    for (let i=1; i<points.length; i++) {
+      const a1 = Math.atan2(points[i-1].y-cy, points[i-1].x-cx);
+      const a2 = Math.atan2(points[i].y-cy, points[i].x-cx);
+      totalTurn += Math.abs(angleDelta(a1,a2));
+    }
+
+    const radius = points.reduce((s,p)=>s+Math.hypot(p.x-cx,p.y-cy),0)/points.length;
+    if (radius > 0.035 && totalTurn > Math.PI*1.45) {
+      gestureEl.textContent = "🌀 SWIRL DETECTED";
+      statusEl.textContent = "Release/stop the swirl to trigger a throw later.";
+      fill.style.width = "100%";
+      return;
+    }
+  }
+  fill.style.width = `${Math.min(100, swirlScore*100)}%`;
+}
+
+function process(result) {
+  const lm = result.landmarks?.[0];
+  if (!lm) {
+    gestureEl.textContent = "No hand";
+    statusEl.textContent = "Put one hand in view.";
+    debugEl.textContent = "Hand: none";
+    drawLandmarks(null);
+    points=[]; lastAngle=null; swirlScore=0;
+    fill.style.width="0%";
+    return;
+  }
+
+  drawLandmarks(lm);
+
+  const top = result.gestures?.[0]?.[0];
+  const name = top?.categoryName || "Unknown";
+  const score = top?.score ?? 0;
+
+  let label = name;
+  if (name === "Pointing_Up") label = "☝️ POINT";
+  else if (name === "Victory") label = "✌️ PEACE";
+  else if (name === "Closed_Fist") label = "✊ FIST";
+  else if (name === "Open_Palm") label = "🖐️ OPEN PALM";
+
+  gestureEl.textContent = label;
+  statusEl.textContent = `Confidence: ${(score*100).toFixed(0)}%`;
+  debugEl.textContent = `Hand: detected | x=${lm[8].x.toFixed(2)} y=${lm[8].y.toFixed(2)}`;
+
+  updateSwirl(lm, name);
+}
+
+async function loop() {
+  if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const result = recognizer.recognizeForVideo(video, performance.now());
+    process(result);
+  }
+  requestAnimationFrame(loop);
+}
+
+startBtn.onclick = async () => {
+  startBtn.disabled = true;
+  startBtn.textContent = "LOADING…";
+  try {
+    statusEl.textContent = "Loading hand model…";
+    const vision = await FilesetResolver.forVisionTasks(WASM);
+    recognizer = await GestureRecognizer.createFromOptions(vision, {
+      baseOptions: { modelAssetPath: MODEL },
+      runningMode: "VIDEO",
+      numHands: 1,
+      minHandDetectionConfidence: 0.55,
+      minHandPresenceConfidence: 0.55,
+      minTrackingConfidence: 0.55
+    });
+
+    statusEl.textContent = "Requesting camera permission…";
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "user", width: {ideal: 640}, height: {ideal: 480} },
+      audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+    resize();
+    startBtn.style.display = "none";
+    statusEl.textContent = "Hand tracking active.";
+    loop();
+  } catch (e) {
+    console.error(e);
+    statusEl.textContent =
+      "Camera/model failed: " + (e?.message || e) +
+      " — try opening this page from HTTPS/localhost and allow Camera.";
+    startBtn.disabled = false;
+    startBtn.textContent = "TRY AGAIN";
+  }
+};
+</script>
+</body>
+</html>
